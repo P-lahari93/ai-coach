@@ -1,3 +1,4 @@
+# FILE: backend/app/main.py
 from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
@@ -10,7 +11,8 @@ from jose import JWTError
 
 from app.api.v1.api import api_router
 from app.core.config import settings
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, CrisisContentDetectedError
+from app.ai.safety_engine import CRISIS_RESOURCES
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.request_id import RequestIDMiddleware
 
@@ -48,6 +50,33 @@ app.add_middleware(LoggingMiddleware)
 
 
 # ── Exception handlers ─────────────────────────────────────────────────────────
+@app.exception_handler(CrisisContentDetectedError)
+async def crisis_content_handler(
+    request: Request, exc: CrisisContentDetectedError
+) -> JSONResponse:
+    """
+    Deliberately returns 200, not a 4xx — nothing technically "failed."
+    The request was intentionally not carried forward to AI generation;
+    the response body signals that via blocked=True + support_resources,
+    so the frontend can render a supportive UI component rather than a
+    generic error toast.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "blocked": True,
+            "block_reason": "crisis_support",
+            "message": (
+                "We noticed something in your message that sounded like "
+                "you might be going through a difficult time. You don't "
+                "have to go through this alone — the resources below are "
+                "here if you'd like support."
+            ),
+            "support_resources": CRISIS_RESOURCES,
+        },
+    )
+
+
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     return JSONResponse(

@@ -3,12 +3,19 @@
 KnowledgeBaseService — KB CRUD, source management, retrieval resolution.
 
 KnowledgeSourceService — source ingestion lifecycle (create, list, delete).
+
+Tenant scoping:
+  KnowledgeBase has its own tenant_id column — checked directly.
+  KnowledgeSource has NO tenant_id column; tenancy is inherited through
+  its parent KB (kb_id). Every source operation here first loads the
+  parent KB and checks kb.tenant_id == tenant_id before touching the
+  source — this was previously missing entirely.
 """
 from __future__ import annotations
 
 from uuid import UUID
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.database.unit_of_work import UnitOfWork
 from app.models.knowledge import KnowledgeBase, KnowledgeSource
 from app.repositories.base import Page
@@ -23,7 +30,7 @@ class KnowledgeBaseService:
     """
     Knowledge base lifecycle management.
 
-    Each method opens its own UnitOfWork.
+    Each method opens its own UnitOfWork, scoped to the caller's tenant.
     """
 
     # ── Listing ───────────────────────────────────────────────────────────────
@@ -34,11 +41,8 @@ class KnowledgeBaseService:
         """
         List all knowledge bases for a tenant (both 'tenant' and 'module'
         scopes).
-
-        Raises:
-            None — empty page returned if no KBs exist
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             return await uow.knowledge_bases.list_by_tenant(
                 tenant_id, page=page, page_size=page_size
             )
@@ -51,13 +55,14 @@ class KnowledgeBaseService:
         """
         Fetch a knowledge base by id.
 
-        When tenant_id is provided, acts as a belt-and-suspenders guard
-        over RLS.
+        tenant_id scopes both the UnitOfWork (RLS) and the repository
+        read as defence-in-depth.
 
         Raises:
-            NotFoundError — KB not found or is soft-deleted
+            NotFoundError — KB not found, soft-deleted, or belongs to a
+                             different tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             kb = await uow.knowledge_bases.get_by_id(kb_id, tenant_id=tenant_id)
             if kb is None:
                 raise NotFoundError("KnowledgeBase", kb_id)
@@ -84,7 +89,7 @@ class KnowledgeBaseService:
             ValidationError — scope/module_id inconsistency (raised by repo)
             ConflictError   — name already exists for this tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             kb = await uow.knowledge_bases.create(
                 KnowledgeBaseCreate(
                     tenant_id=tenant_id,
@@ -101,6 +106,7 @@ class KnowledgeBaseService:
     async def update_knowledge_base(
         self,
         kb_id: UUID,
+        tenant_id: UUID | None = None,
         name: str | None = None,
         description: str | None = None,
     ) -> KnowledgeBase:
@@ -108,9 +114,18 @@ class KnowledgeBaseService:
         Apply a partial update to a knowledge base.
 
         Raises:
-            NotFoundError — KB not found
+            NotFoundError         — KB not found
+            PermissionDeniedError — KB belongs to a different tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            kb = await uow.knowledge_bases.get_by_id(kb_id)
+            if kb is None:
+                raise NotFoundError("KnowledgeBase", kb_id)
+            if kb.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to modify this knowledge base."
+                )
+
             kb = await uow.knowledge_bases.update(
                 kb_id,
                 KnowledgeBaseUpdate(name=name, description=description),
@@ -118,14 +133,28 @@ class KnowledgeBaseService:
             await uow.commit()
             return kb
 
-    async def delete_knowledge_base(self, kb_id: UUID) -> None:
+    async def delete_knowledge_base(
+        self, kb_id: UUID, tenant_id: UUID | None = None
+    ) -> None:
         """
         Soft-delete a knowledge base.
 
+        Previously this had NO tenant check at all — any authenticated
+        user could delete any other tenant's knowledge base. Fixed here.
+
         Raises:
-            NotFoundError — KB not found
+            NotFoundError         — KB not found
+            PermissionDeniedError — KB belongs to a different tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            kb = await uow.knowledge_bases.get_by_id(kb_id)
+            if kb is None:
+                raise NotFoundError("KnowledgeBase", kb_id)
+            if kb.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to delete this knowledge base."
+                )
+
             await uow.knowledge_bases.soft_delete(kb_id)
             await uow.commit()
 
@@ -144,7 +173,7 @@ class KnowledgeBaseService:
         This ordering prioritizes module-specific knowledge over
         tenant-wide knowledge.
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             return await uow.knowledge_bases.get_kb_ids_for_retrieval(
                 module_id, tenant_id
             )
@@ -154,24 +183,39 @@ class KnowledgeSourceService:
     """
     Knowledge source ingestion lifecycle.
 
-    Each method opens its own UnitOfWork.
+    KnowledgeSource has no tenant_id column of its own — every method
+    here resolves tenancy through the parent KnowledgeBase (kb_id) and
+    checks kb.tenant_id == tenant_id before allowing access or mutation.
     """
 
     # ── Listing ───────────────────────────────────────────────────────────────
 
     async def list_sources(
-        self, kb_id: UUID, page: int = 1, page_size: int = 20
+        self,
+        kb_id: UUID,
+        tenant_id: UUID | None = None,
+        page: int = 1,
+        page_size: int = 20,
     ) -> Page[KnowledgeSource]:
         """
         List sources for a knowledge base.
 
-        Returns a paginated result even though the result set is typically
-        small for consistency with other list methods.
+        Previously this had NO tenant/ownership check — any authenticated
+        user could list sources of any KB by id. Fixed here.
 
         Raises:
-            None — empty page returned if no sources exist
+            NotFoundError         — KB not found
+            PermissionDeniedError — KB belongs to a different tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            kb = await uow.knowledge_bases.get_by_id(kb_id)
+            if kb is None:
+                raise NotFoundError("KnowledgeBase", kb_id)
+            if kb.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to access this knowledge base."
+                )
+
             sources = await uow.knowledge_bases.get_active_sources(kb_id)
             # Manual pagination since repository returns list, not Page
             start = (page - 1) * page_size
@@ -186,18 +230,30 @@ class KnowledgeSourceService:
 
     # ── Lookup ────────────────────────────────────────────────────────────────
 
-    async def get_source(self, source_id: UUID) -> KnowledgeSource:
+    async def get_source(
+        self, source_id: UUID, tenant_id: UUID | None = None
+    ) -> KnowledgeSource:
         """
         Fetch a knowledge source by id.
 
+        Previously this had NO tenant/ownership check at all. Fixed here
+        by loading the parent KB and verifying tenant ownership.
+
         Raises:
-            NotFoundError — source not found
+            NotFoundError         — source (or its parent KB) not found
+            PermissionDeniedError — source's KB belongs to a different tenant
         """
-        async with UnitOfWork() as uow:
-            # Use a generic get via session (sources have no dedicated get method)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             source = await uow.session.get(KnowledgeSource, source_id)
-            if source is None or source.is_deleted:
+            if source is None or source.deleted_at is not None:
                 raise NotFoundError("KnowledgeSource", source_id)
+
+            kb = await uow.knowledge_bases.get_by_id(source.kb_id)
+            if kb is None or kb.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to access this knowledge source."
+                )
+
             return source
 
     # ── Create ────────────────────────────────────────────────────────────────
@@ -217,9 +273,9 @@ class KnowledgeSourceService:
         and process it asynchronously.
 
         Raises:
-            NotFoundError — KB not found
+            NotFoundError — KB not found (or not visible to this tenant)
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             kb = await uow.knowledge_bases.get_by_id(kb_id, tenant_id=tenant_id)
             if kb is None:
                 raise NotFoundError("KnowledgeBase", kb_id)
@@ -251,9 +307,9 @@ class KnowledgeSourceService:
         file_path is the server-side storage path; never exposed to clients.
 
         Raises:
-            NotFoundError — KB not found
+            NotFoundError — KB not found (or not visible to this tenant)
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             kb = await uow.knowledge_bases.get_by_id(kb_id, tenant_id=tenant_id)
             if kb is None:
                 raise NotFoundError("KnowledgeBase", kb_id)
@@ -286,9 +342,9 @@ class KnowledgeSourceService:
         The ingestion worker will fetch + extract main content.
 
         Raises:
-            NotFoundError — KB not found
+            NotFoundError — KB not found (or not visible to this tenant)
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             kb = await uow.knowledge_bases.get_by_id(kb_id, tenant_id=tenant_id)
             if kb is None:
                 raise NotFoundError("KnowledgeBase", kb_id)
@@ -307,14 +363,34 @@ class KnowledgeSourceService:
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
-    async def delete_source(self, source_id: UUID) -> None:
+    async def delete_source(
+        self, source_id: UUID, tenant_id: UUID | None = None
+    ) -> None:
         """
         Soft-delete a knowledge source.
 
+        Previously this had NO tenant/ownership check — any authenticated
+        user could delete any source by id, cross-tenant. Fixed here by
+        loading the parent KB first and verifying tenant ownership.
+
         The associated chunks are cleaned up by a background job
         (not cascade-deleted immediately).
+
+        Raises:
+            NotFoundError         — source (or its parent KB) not found
+            PermissionDeniedError — source's KB belongs to a different tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            source = await uow.session.get(KnowledgeSource, source_id)
+            if source is None or source.deleted_at is not None:
+                raise NotFoundError("KnowledgeSource", source_id)
+
+            kb = await uow.knowledge_bases.get_by_id(source.kb_id)
+            if kb is None or kb.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to delete this knowledge source."
+                )
+
             deleted = await uow.knowledge_bases.soft_delete_source(source_id)
             if not deleted:
                 raise NotFoundError("KnowledgeSource", source_id)

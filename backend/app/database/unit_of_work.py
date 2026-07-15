@@ -6,8 +6,27 @@ Architecture:
   Services receive a UoW instance and access all repositories through it.
   No repository ever calls commit() or rollback() directly — only UoW does.
 
+Tenant scoping (RLS):
+  On __aenter__, the UoW tells PostgreSQL which tenant this transaction
+  is allowed to see, via SET LOCAL app.current_tenant_id / app.is_superadmin.
+  RLS policies (migration 011) enforce isolation using these GUCs.
+
+  - UnitOfWork(tenant_id=x)   → RLS active, only tenant x's rows visible.
+  - UnitOfWork.system()       → explicit, greppable superadmin bypass —
+                                 for genuine platform/background contexts
+                                 only (migrations, cron, cross-tenant admin).
+  - UnitOfWork()              → NEITHER of the above. This is intentionally
+                                 fail-closed: with RLS forced and no GUC
+                                 set, every tenant-scoped table returns zero
+                                 rows. This is the safe default — request
+                                 handlers must pass tenant_id explicitly.
+
+  Do NOT reach for UnitOfWork.system() to make an error go away — a bare
+  UnitOfWork() silently returning nothing usually means a real tenant_id
+  was never threaded through; fix the call site.
+
   Pattern:
-      async with UnitOfWork() as uow:
+      async with UnitOfWork(tenant_id=current_tenant_id) as uow:
           user = await uow.users.get_by_email("alice@example.com")
           await uow.commit()
 
@@ -15,7 +34,6 @@ Architecture:
 
 Repository access:
   Repositories are created lazily on first access (cached on the instance).
-  This avoids constructing unused repositories on every request.
 
 Transaction methods:
   commit()   — flush + commit the current transaction
@@ -25,27 +43,18 @@ Transaction methods:
 
 Nesting:
   The UoW does not support nested transactions (no SAVEPOINT).
-  For nested operations, use the same UoW and call flush() to detect
-  constraint violations before the outer commit.
 
 FastAPI integration:
-  The recommended pattern for route handlers is via a FastAPI dependency
-  that yields a UoW instance (see app/api/v1/dependencies/uow.py).
-  Do NOT share a UoW across concurrent request handlers.
-
-Design decisions:
-  - Repositories are injected with the same session so all writes
-    within a single UoW are in the same transaction.
-  - expire_on_commit=False on the session factory means loaded ORM
-    objects remain accessible after commit without an extra SELECT.
-  - autoflush=False means no implicit flushes during query execution;
-    the service layer controls when to flush.
+  See app/api/v1/dependencies/uow.py — request handlers should receive a
+  tenant-scoped UoW via dependency injection, not construct their own.
 """
 from __future__ import annotations
 
+import uuid
 from types import TracebackType
 from typing import TYPE_CHECKING
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import AsyncSessionLocal
@@ -72,29 +81,52 @@ class UnitOfWork:
     Must be used as an async context manager.
 
     Usage:
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=current_tenant_id) as uow:
             module = await uow.coaching_modules.get_by_key("sbi_feedback")
             await uow.commit()
 
-    Or with an existing session (e.g. in tests or FastAPI dependencies):
-        async with UnitOfWork(session=existing_session) as uow:
+    System / background contexts (migrations, cron, cross-tenant admin):
+        async with UnitOfWork.system() as uow:
             ...
     """
 
     def __init__(
         self,
         session: AsyncSession | None = None,
+        *,
+        tenant_id: "uuid.UUID | str | None" = None,
+        superadmin: bool = False,
     ) -> None:
         """
         Parameters:
             session: optional externally-managed AsyncSession.
-                     When provided, the UoW does NOT close it on exit —
-                     the caller owns the session lifetime.
-                     When None (default), the UoW creates and owns its
-                     own session from AsyncSessionLocal.
+                     When provided, the UoW does NOT close it on exit.
+            tenant_id: the authenticated caller's tenant. When set, RLS
+                       scopes every query in this transaction to that
+                       tenant only. Validated via uuid.UUID() before use —
+                       invalid input raises ValueError, never reaches SQL.
+            superadmin: explicit, rare escape hatch for genuine
+                        platform/background contexts. Prefer
+                        UnitOfWork.system() over passing this directly.
+
+        If neither tenant_id nor superadmin is given, the transaction is
+        NOT elevated — RLS (once FORCE-enabled, see migration 011) will
+        make tenant-scoped tables return zero rows. This is intentional:
+        a bare UnitOfWork() must never silently see everything.
         """
+        if tenant_id is not None and superadmin:
+            raise ValueError(
+                "UnitOfWork: pass either tenant_id or superadmin=True, not both."
+            )
+
         self._external_session = session is not None
         self._session: AsyncSession = session or AsyncSessionLocal()
+
+        self._tenant_id: str | None = (
+            str(uuid.UUID(str(tenant_id))) if tenant_id is not None else None
+        )
+        self._superadmin = superadmin
+        self._rls_applied = False
 
         # Lazy repository cache — populated on first access
         self._users: UserRepository | None = None
@@ -111,9 +143,22 @@ class UnitOfWork:
         self._user_progress: UserProgressRepository | None = None
         self._analytics: AnalyticsRepository | None = None
 
+    @classmethod
+    def system(cls, session: AsyncSession | None = None) -> "UnitOfWork":
+        """
+        Explicit, greppable superadmin/system context.
+
+        Use ONLY for genuine platform-level operations that must see
+        across all tenants: migrations, scheduled/cron jobs, superadmin
+        tooling, cross-tenant analytics. Do NOT use this in a normal
+        request handler just to make a missing tenant_id error go away.
+        """
+        return cls(session=session, superadmin=True)
+
     # ── Context manager ───────────────────────────────────────────────────────
 
     async def __aenter__(self) -> "UnitOfWork":
+        await self._apply_rls_context()
         return self
 
     async def __aexit__(
@@ -126,6 +171,30 @@ class UnitOfWork:
             await self.rollback()
         await self.close()
 
+    async def _apply_rls_context(self) -> None:
+        """
+        Tell PostgreSQL which tenant (or superadmin) this transaction is,
+        via SET LOCAL. This only lasts for the current transaction and
+        must be re-applied on every new UnitOfWork.
+
+        tenant_id was already validated as a real UUID in __init__, so
+        it is safe to interpolate directly — SET LOCAL does not support
+        bind parameters in PostgreSQL's wire protocol.
+        """
+        if self._tenant_id is not None:
+            await self._session.execute(
+                text(f"SET LOCAL app.current_tenant_id = '{self._tenant_id}'")
+            )
+            await self._session.execute(text("SET LOCAL app.is_superadmin = 'false'"))
+        elif self._superadmin:
+            await self._session.execute(text("SET LOCAL app.is_superadmin = 'true'"))
+        else:
+            # Fail-closed: no GUC set at all. RLS policies will treat this
+            # as "no tenant, not superadmin" — tenant-scoped tables return
+            # zero rows rather than everything.
+            await self._session.execute(text("SET LOCAL app.is_superadmin = 'false'"))
+        self._rls_applied = True
+
     # ── Transaction control ───────────────────────────────────────────────────
 
     async def commit(self) -> None:
@@ -137,21 +206,11 @@ class UnitOfWork:
         await self._session.rollback()
 
     async def flush(self) -> None:
-        """
-        Flush pending ORM changes to the DB without committing.
-
-        Use this to materialise PKs and trigger DB-level constraint
-        checks before the end of the transaction.
-        """
+        """Flush pending ORM changes to the DB without committing."""
         await self._session.flush()
 
     async def close(self) -> None:
-        """
-        Close the session.
-
-        Called automatically by __aexit__. Safe to call manually.
-        When using an external session, this is a no-op.
-        """
+        """Close the session. Safe to call manually."""
         if not self._external_session:
             await self._session.close()
 
@@ -159,10 +218,7 @@ class UnitOfWork:
 
     @property
     def session(self) -> AsyncSession:
-        """
-        Direct session access for edge cases (e.g. raw SQL, bulk ops).
-        Prefer using repositories over direct session access.
-        """
+        """Direct session access for edge cases (raw SQL, bulk ops)."""
         return self._session
 
     # ── Auth repositories ─────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+# FILE: backend/app/repositories/session/feedback_report_repository.py
 """
 FeedbackReportRepository — async SQLAlchemy 2.0 implementation.
 
@@ -126,7 +127,10 @@ class FeedbackReportRepository(
         return result.scalar_one_or_none()
 
     async def get_by_session(
-        self, coaching_session_id: UUID
+        self,
+        coaching_session_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
     ) -> FeedbackReport | None:
         """
         Fetch the most recent feedback report for a CoachingSession.
@@ -139,11 +143,16 @@ class FeedbackReportRepository(
             .order_by(FeedbackReport.created_at.desc())
             .limit(1)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(FeedbackReport.tenant_id == tenant_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_by_roleplay_session(
-        self, roleplay_session_id: UUID
+        self,
+        roleplay_session_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
     ) -> FeedbackReport | None:
         """
         Fetch the most recent feedback report for a RoleplaySession.
@@ -156,6 +165,8 @@ class FeedbackReportRepository(
             .order_by(FeedbackReport.created_at.desc())
             .limit(1)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(FeedbackReport.tenant_id == tenant_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -238,6 +249,7 @@ class FeedbackReportRepository(
         *,
         user_rating: int,
         user_notes: str | None = None,
+        tenant_id: UUID | None = None,
     ) -> FeedbackReport:
         """
         Persist a learner's 1-5 star rating (and optional note).
@@ -253,9 +265,11 @@ class FeedbackReportRepository(
         stmt = (
             update(FeedbackReport)
             .where(FeedbackReport.id == report_id)
-            .values(**values)
-            .returning(FeedbackReport)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(FeedbackReport.tenant_id == tenant_id)
+            
+        stmt = stmt.values(**values).returning(FeedbackReport)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:

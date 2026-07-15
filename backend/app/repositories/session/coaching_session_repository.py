@@ -115,7 +115,10 @@ class CoachingSessionRepository(
         return result.scalar_one_or_none()
 
     async def get_with_messages(
-        self, session_id: UUID
+        self,
+        session_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
     ) -> CoachingSession | None:
         """Load a session, then separately load its conversation messages."""
         from sqlalchemy import select as sa_select
@@ -126,6 +129,8 @@ class CoachingSessionRepository(
             .where(CoachingSession.id == session_id)
             .where(CoachingSession.deleted_at.is_(None))
         )
+        if tenant_id is not None:
+            stmt = stmt.where(CoachingSession.tenant_id == tenant_id)
         result = await self._session.execute(stmt)
         session = result.scalar_one_or_none()
         if session is None:

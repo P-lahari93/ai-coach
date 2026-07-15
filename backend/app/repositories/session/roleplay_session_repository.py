@@ -1,3 +1,4 @@
+# FILE: backend/app/repositories/session/roleplay_session_repository.py
 """
 RoleplaySessionRepository — async SQLAlchemy 2.0 implementation.
 
@@ -114,8 +115,12 @@ class RoleplaySessionRepository(
         return result.scalar_one_or_none()
 
     async def get_with_messages(
-        self, session_id: UUID
+        self,
+        session_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession | None:
+        """Fetch roleplay session with conversation history attached under a strict tenant view."""
         from sqlalchemy import select as sa_select
         from app.models.session import RoleplayMessage
 
@@ -124,6 +129,8 @@ class RoleplaySessionRepository(
             .where(RoleplaySession.id == session_id)
             .where(RoleplaySession.deleted_at.is_(None))
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
         result = await self._session.execute(stmt)
         session = result.scalar_one_or_none()
         if session is None:
@@ -253,6 +260,7 @@ class RoleplaySessionRepository(
         *,
         final_score: Decimal | None,
         expected_version: int,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """Transition active/paused → completed."""
         now = datetime.now(timezone.utc)
@@ -262,18 +270,21 @@ class RoleplaySessionRepository(
             .where(RoleplaySession.deleted_at.is_(None))
             .where(RoleplaySession.version == expected_version)
             .where(RoleplaySession.status.in_(["active", "paused"]))
-            .values(
-                status="completed",
-                final_score=final_score,
-                completed_at=now,
-                version=RoleplaySession.version + 1,
-            )
-            .returning(RoleplaySession)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
+            
+        stmt = stmt.values(
+            status="completed",
+            final_score=final_score,
+            completed_at=now,
+            version=RoleplaySession.version + 1,
+        ).returning(RoleplaySession)
+        
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
-            check = await self.get_by_id(session_id)
+            check = await self.get_by_id(session_id, tenant_id=tenant_id)
             if check is None:
                 raise NotFoundError("RoleplaySession", session_id)
             if check.status == "completed":
@@ -286,6 +297,7 @@ class RoleplaySessionRepository(
         session_id: UUID,
         *,
         expected_version: int,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """Transition active → paused."""
         stmt = (
@@ -294,9 +306,11 @@ class RoleplaySessionRepository(
             .where(RoleplaySession.deleted_at.is_(None))
             .where(RoleplaySession.version == expected_version)
             .where(RoleplaySession.status == "active")
-            .values(status="paused", version=RoleplaySession.version + 1)
-            .returning(RoleplaySession)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
+            
+        stmt = stmt.values(status="paused", version=RoleplaySession.version + 1).returning(RoleplaySession)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
@@ -308,6 +322,7 @@ class RoleplaySessionRepository(
         session_id: UUID,
         *,
         expected_version: int,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """Transition active/paused → abandoned."""
         stmt = (
@@ -316,9 +331,11 @@ class RoleplaySessionRepository(
             .where(RoleplaySession.deleted_at.is_(None))
             .where(RoleplaySession.version == expected_version)
             .where(RoleplaySession.status.in_(["active", "paused"]))
-            .values(status="abandoned", version=RoleplaySession.version + 1)
-            .returning(RoleplaySession)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
+            
+        stmt = stmt.values(status="abandoned", version=RoleplaySession.version + 1).returning(RoleplaySession)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
@@ -330,22 +347,23 @@ class RoleplaySessionRepository(
         session_id: UUID,
         *,
         expected_version: int,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
-        """
-        Atomically increment turn_count + bump version.
-        Called after every user message is accepted.
-        """
+        """Atomically increment turn_count + bump version."""
         stmt = (
             update(RoleplaySession)
             .where(RoleplaySession.id == session_id)
             .where(RoleplaySession.version == expected_version)
             .where(RoleplaySession.deleted_at.is_(None))
-            .values(
-                turn_count=RoleplaySession.turn_count + 1,
-                version=RoleplaySession.version + 1,
-            )
-            .returning(RoleplaySession)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
+            
+        stmt = stmt.values(
+            turn_count=RoleplaySession.turn_count + 1,
+            version=RoleplaySession.version + 1,
+        ).returning(RoleplaySession)
+        
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
@@ -358,6 +376,7 @@ class RoleplaySessionRepository(
         context: dict,
         *,
         expected_version: int,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """Update the mutable engine context bag on a session."""
         stmt = (
@@ -365,9 +384,11 @@ class RoleplaySessionRepository(
             .where(RoleplaySession.id == session_id)
             .where(RoleplaySession.version == expected_version)
             .where(RoleplaySession.deleted_at.is_(None))
-            .values(context=context, version=RoleplaySession.version + 1)
-            .returning(RoleplaySession)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(RoleplaySession.tenant_id == tenant_id)
+            
+        stmt = stmt.values(context=context, version=RoleplaySession.version + 1).returning(RoleplaySession)
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:
@@ -377,9 +398,9 @@ class RoleplaySessionRepository(
     # ── Message management ────────────────────────────────────────────────────
 
     async def append_message(
-        self, data: RoleplayMessageCreate
+        self, data: RoleplayMessageCreate, tenant_id: UUID | None = None
     ) -> RoleplayMessage:
-        """Append a turn message to a roleplay session."""
+        """Append a turn message to a roleplay session validation pipeline."""
         try:
             msg = RoleplayMessage(
                 session_id=data.session_id,

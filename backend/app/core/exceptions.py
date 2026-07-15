@@ -1,3 +1,4 @@
+# FILE: backend/app/core/exceptions.py
 """
 Domain exceptions — all business logic raises these.
 FastAPI exception handlers map them to HTTP responses.
@@ -26,6 +27,27 @@ class ValidationError(AppError):
 class BadRequestError(AppError):
     status_code = 400
     detail = "Bad request."
+
+
+class ContentSafetyError(AppError):
+    status_code = 400
+    detail = "Content did not pass safety checks."
+
+class ContentSafetyError(AppError):
+    status_code = 400
+    detail = "Content did not pass safety checks."
+
+
+class CrisisContentDetectedError(AppError):
+    """
+    Raised when SafetyEngine flags content as crisis/self-harm language.
+
+    Deliberately NOT a generic 400 — main.py registers a dedicated
+    handler for this exception that returns a supportive message with
+    resources instead of a bare rejection. See app/main.py.
+    """
+    status_code = 200
+    detail = "We noticed something in your message we wanted to check in about."
 
 
 # ── 401 ──────────────────────────────────────────────────────────────────────

@@ -7,12 +7,22 @@ Responsibilities:
 - CRUD operations on draft modules
 - Status transitions: draft → published, published → archived
 - Version management delegation to ModuleVersionRepository
+
+Tenant scoping:
+  Every method accepts tenant_id and passes it to UnitOfWork(tenant_id=...)
+  so RLS (migration 011) is active. UnitOfWork() with no args is fail-closed.
+
+  Mutations (update/publish/archive/delete) additionally check ownership
+  explicitly: a module belongs to a tenant (or is global, tenant_id=None).
+  Previously these methods had NO tenant check at all — any authenticated
+  user could edit/publish/archive/delete any other tenant's module by
+  guessing its UUID. That is fixed here.
 """
 from __future__ import annotations
 
 from uuid import UUID
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, PermissionDeniedError
 from app.database.unit_of_work import UnitOfWork
 from app.models.module import CoachingModule, ModuleVersion
 from app.repositories.base import Page
@@ -26,7 +36,7 @@ class CoachingModuleService:
     """
     Coaching module lifecycle management.
 
-    Each method opens its own UnitOfWork.
+    Each method opens its own UnitOfWork, scoped to the caller's tenant.
     """
 
     # ── Listing ───────────────────────────────────────────────────────────────
@@ -41,19 +51,11 @@ class CoachingModuleService:
         """
         List modules visible to a tenant (global + tenant-owned).
 
-        When tenant_id is None (superadmin context), all modules are
-        returned regardless of tenant scope.
-
         status can be: "draft", "published", "archived", or None (all).
         """
-        async with UnitOfWork() as uow:
-            if tenant_id is not None:
-                return await uow.coaching_modules.list_by_tenant(
-                    tenant_id, status=status, page=page, page_size=page_size
-                )
-            # Superadmin: list all (no tenant filter)
-            return await uow.coaching_modules.list_paginated(
-                page=page, page_size=page_size
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            return await uow.coaching_modules.list_by_tenant(
+                tenant_id, status=status, page=page, page_size=page_size
             )
 
     async def list_published(
@@ -67,24 +69,35 @@ class CoachingModuleService:
 
         Used for the learner module catalog.
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             return await uow.coaching_modules.list_published(
                 tenant_id=tenant_id, page=page, page_size=page_size
             )
 
     # ── Lookup ────────────────────────────────────────────────────────────────
 
-    async def get_module(self, module_id: UUID) -> CoachingModule:
+    async def get_module(
+        self, module_id: UUID, tenant_id: UUID | None = None
+    ) -> CoachingModule:
         """
-        Fetch a module by id (no relations loaded).
+        Fetch a module by id.
+
+        Visible if the module is global (tenant_id is None) OR belongs to
+        the caller's tenant. Otherwise treated as not found — existence
+        is not confirmed to callers outside the module's tenant.
 
         Raises:
-            NotFoundError — module not found or is soft-deleted
+            NotFoundError — module not found, soft-deleted, or not visible
+                             to this tenant
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             module = await uow.coaching_modules.get(module_id)
             if module is None:
                 raise NotFoundError("CoachingModule", module_id)
+
+            if module.tenant_id is not None and module.tenant_id != tenant_id:
+                raise NotFoundError("CoachingModule", module_id)
+
             return module
 
     async def get_module_by_key(
@@ -100,7 +113,7 @@ class CoachingModuleService:
         Raises:
             NotFoundError — module not found for the given scope
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             module = await uow.coaching_modules.get_by_key(
                 key, tenant_id=tenant_id
             )
@@ -126,7 +139,7 @@ class CoachingModuleService:
         Raises:
             ConflictError — key already exists for this tenant scope
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             module = await uow.coaching_modules.create(
                 CoachingModuleCreate(
                     key=key,
@@ -143,17 +156,33 @@ class CoachingModuleService:
             return module
 
     async def update_module(
-        self, module_id: UUID, **kwargs
+        self, module_id: UUID, tenant_id: UUID | None = None, **kwargs
     ) -> CoachingModule:
         """
         Apply a partial update to a module.
 
         Accepts: name, icon, blurb, gamification_overrides.
 
+        Only the owning tenant may update a tenant-scoped module. Global
+        (platform-authored) modules cannot be edited through this
+        tenant-facing path at all — that requires a separate superadmin
+        flow (not yet implemented).
+
         Raises:
-            NotFoundError — module not found
+            NotFoundError         — module not found
+            PermissionDeniedError — module belongs to a different tenant,
+                                     or is a global module
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            module = await uow.coaching_modules.get(module_id)
+            if module is None:
+                raise NotFoundError("CoachingModule", module_id)
+
+            if module.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to modify this module."
+                )
+
             module = await uow.coaching_modules.update(
                 module_id,
                 CoachingModuleUpdate(
@@ -166,36 +195,59 @@ class CoachingModuleService:
             await uow.commit()
             return module
 
-    async def delete_module(self, module_id: UUID) -> None:
+    async def delete_module(
+        self, module_id: UUID, tenant_id: UUID | None = None
+    ) -> None:
         """
         Soft-delete a module.
 
+        Only the owning tenant may delete a tenant-scoped module.
+
         Raises:
-            NotFoundError — module not found
+            NotFoundError         — module not found
+            PermissionDeniedError — module belongs to a different tenant,
+                                     or is a global module
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            module = await uow.coaching_modules.get(module_id)
+            if module is None:
+                raise NotFoundError("CoachingModule", module_id)
+
+            if module.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to delete this module."
+                )
+
             await uow.coaching_modules.soft_delete(module_id)
             await uow.commit()
 
     # ── Status transitions ────────────────────────────────────────────────────
 
     async def publish_module(
-        self, module_id: UUID, published_by: UUID
+        self, module_id: UUID, published_by: UUID, tenant_id: UUID | None = None
     ) -> CoachingModule:
         """
         Transition a module's status from draft to published.
 
-        Version-gated to prevent concurrent publish attempts.
+        Version-gated to prevent concurrent publish attempts. Only the
+        owning tenant may publish a tenant-scoped module.
 
         Raises:
-            NotFoundError       — module not found
-            OptimisticLockError — concurrent edit
-            ConflictError       — module is already published
+            NotFoundError         — module not found
+            PermissionDeniedError — module belongs to a different tenant,
+                                     or is a global module
+            OptimisticLockError   — concurrent edit
+            ConflictError         — module is already published
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             module = await uow.coaching_modules.get(module_id)
             if module is None:
                 raise NotFoundError("CoachingModule", module_id)
+
+            if module.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to publish this module."
+                )
 
             module = await uow.coaching_modules.publish_module(
                 module_id, expected_version=module.version
@@ -203,22 +255,32 @@ class CoachingModuleService:
             await uow.commit()
             return module
 
-    async def archive_module(self, module_id: UUID) -> CoachingModule:
+    async def archive_module(
+        self, module_id: UUID, tenant_id: UUID | None = None
+    ) -> CoachingModule:
         """
         Transition a module's status to archived.
 
         Archived modules cannot be started as new sessions; existing
-        sessions continue to reference the pinned version.
+        sessions continue to reference the pinned version. Only the
+        owning tenant may archive a tenant-scoped module.
 
         Raises:
-            NotFoundError       — module not found
-            OptimisticLockError — concurrent edit
-            ConflictError       — module is already archived
+            NotFoundError         — module not found
+            PermissionDeniedError — module belongs to a different tenant,
+                                     or is a global module
+            OptimisticLockError   — concurrent edit
+            ConflictError         — module is already archived
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             module = await uow.coaching_modules.get(module_id)
             if module is None:
                 raise NotFoundError("CoachingModule", module_id)
+
+            if module.tenant_id != tenant_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to archive this module."
+                )
 
             module = await uow.coaching_modules.archive_module(
                 module_id, expected_version=module.version
@@ -228,20 +290,24 @@ class CoachingModuleService:
 
     # ── Version management ────────────────────────────────────────────────────
 
-    async def get_current_version(self, module_id: UUID) -> ModuleVersion:
+    async def get_current_version(
+        self, module_id: UUID, tenant_id: UUID | None = None
+    ) -> ModuleVersion:
         """
         Fetch the current (is_current=True) version for a module.
 
         Raises:
             NotFoundError — module has no current version
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             version = await uow.module_versions.get_current_version(module_id)
             if version is None:
                 raise NotFoundError("ModuleVersion", f"current for {module_id}")
             return version
 
-    async def get_version_full(self, version_id: UUID) -> ModuleVersion:
+    async def get_version_full(
+        self, version_id: UUID, tenant_id: UUID | None = None
+    ) -> ModuleVersion:
         """
         Load a specific version with full definition (steps, templates,
         personas, rubric) eagerly loaded.
@@ -251,7 +317,7 @@ class CoachingModuleService:
         Raises:
             NotFoundError — version not found
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             version = await uow.module_versions.get_version_with_definition(
                 version_id
             )

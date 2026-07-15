@@ -7,6 +7,10 @@ Responsibilities:
 - Add roleplay messages
 - Pause/resume/complete/abandon sessions
 - Update mutable context bag
+
+Tenant scoping:
+  Every method accepts tenant_id and passes it to UnitOfWork(tenant_id=...)
+  so RLS (migration 011) is active. UnitOfWork() with no args is fail-closed.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ class RoleplaySessionService:
     """
     Roleplay session lifecycle management.
 
-    Each method opens its own UnitOfWork.
+    Each method opens its own UnitOfWork, scoped to the caller's tenant.
     """
 
     # ── Session creation ──────────────────────────────────────────────────────
@@ -48,7 +52,7 @@ class RoleplaySessionService:
         Raises:
             NotFoundError — module has no current version
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             version = await uow.module_versions.get_current_version(module_id)
             if version is None:
                 raise NotFoundError(
@@ -72,19 +76,26 @@ class RoleplaySessionService:
     # ── Lookup ────────────────────────────────────────────────────────────────
 
     async def get_session(
-        self, session_id: UUID, user_id: UUID | None = None
+        self,
+        session_id: UUID,
+        user_id: UUID | None = None,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """
         Fetch a roleplay session by id.
 
         When user_id is provided, validates ownership.
+        tenant_id scopes the UnitOfWork (RLS) AND is passed to the
+        repository as defence-in-depth.
 
         Raises:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -95,17 +106,33 @@ class RoleplaySessionService:
 
             return session
 
-    async def get_session_detail(self, session_id: UUID) -> RoleplaySession:
+    async def get_session_detail(
+        self,
+        session_id: UUID,
+        user_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+    ) -> RoleplaySession:
         """
         Fetch a session with messages eagerly loaded.
 
+        When user_id is provided, validates that the session belongs to them.
+
         Raises:
             NotFoundError — session not found
+            PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_with_messages(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_with_messages(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
+
+            if user_id is not None and session.user_id != user_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to access this session."
+                )
+
             return session
 
     # ── Listing ───────────────────────────────────────────────────────────────
@@ -123,7 +150,7 @@ class RoleplaySessionService:
 
         Optionally filtered by tenant_id and/or status.
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             return await uow.roleplay_sessions.list_by_user(
                 user_id,
                 tenant_id=tenant_id,
@@ -142,6 +169,7 @@ class RoleplaySessionService:
         turn_number: int,
         emotion_detected: str | None = None,
         coaching_note: str | None = None,
+        tenant_id: UUID | None = None,
     ) -> RoleplayMessage:
         """
         Append a turn message to a roleplay session.
@@ -151,8 +179,10 @@ class RoleplaySessionService:
         Raises:
             NotFoundError — session not found
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -172,7 +202,7 @@ class RoleplaySessionService:
     # ── Status transitions ────────────────────────────────────────────────────
 
     async def pause_session(
-        self, session_id: UUID, user_id: UUID
+        self, session_id: UUID, user_id: UUID, tenant_id: UUID | None = None
     ) -> RoleplaySession:
         """
         Transition active → paused.
@@ -181,8 +211,10 @@ class RoleplaySessionService:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -198,7 +230,7 @@ class RoleplaySessionService:
             return session
 
     async def resume_session(
-        self, session_id: UUID, user_id: UUID
+        self, session_id: UUID, user_id: UUID, tenant_id: UUID | None = None
     ) -> RoleplaySession:
         """
         Transition paused → active.
@@ -210,8 +242,10 @@ class RoleplaySessionService:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -220,19 +254,15 @@ class RoleplaySessionService:
                     "You do not have permission to resume this session."
                 )
 
-            # Update status to active (manual update via repo base method)
-            from app.repositories.session.roleplay_session_repository import (
-                RoleplaySessionUpdate,
-            )
-
-            # Direct status update is not supported by the repository;
-            # We must use the base update method with version check
-            # For now, skip resume logic — the repository does not support it.
-            # In production, add a resume_session method to the repo.
+            # Direct status update is not supported by the repository yet.
             raise NotImplementedError("Resume not yet implemented in repository.")
 
     async def complete_session(
-        self, session_id: UUID, final_score: Decimal | None, user_id: UUID
+        self,
+        session_id: UUID,
+        final_score: Decimal | None,
+        user_id: UUID,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """
         Transition active/paused → completed.
@@ -241,8 +271,10 @@ class RoleplaySessionService:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -260,7 +292,7 @@ class RoleplaySessionService:
             return session
 
     async def abandon_session(
-        self, session_id: UUID, user_id: UUID
+        self, session_id: UUID, user_id: UUID, tenant_id: UUID | None = None
     ) -> RoleplaySession:
         """
         Transition active/paused → abandoned.
@@ -269,8 +301,10 @@ class RoleplaySessionService:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 
@@ -288,7 +322,10 @@ class RoleplaySessionService:
     # ── Context update ────────────────────────────────────────────────────────
 
     async def update_context(
-        self, session_id: UUID, context_updates: dict
+        self,
+        session_id: UUID,
+        context_updates: dict,
+        tenant_id: UUID | None = None,
     ) -> RoleplaySession:
         """
         Update the mutable context JSONB bag on a roleplay session.
@@ -298,8 +335,10 @@ class RoleplaySessionService:
         Raises:
             NotFoundError — session not found
         """
-        async with UnitOfWork() as uow:
-            session = await uow.roleplay_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.roleplay_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("RoleplaySession", session_id)
 

@@ -8,6 +8,11 @@ Responsibilities:
 - Add conversation messages
 - Complete/abandon sessions (status transitions)
 - List user sessions
+
+Tenant scoping:
+  Every method that touches the DB now accepts tenant_id and passes it to
+  UnitOfWork(tenant_id=...) so RLS (migration 011) is active for the query.
+  This is required now that UnitOfWork() with no args is fail-closed.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ class CoachingSessionService:
     """
     Coaching session lifecycle management.
 
-    Each method opens its own UnitOfWork.
+    Each method opens its own UnitOfWork, scoped to the caller's tenant.
     """
 
     # ── Session creation ──────────────────────────────────────────────────────
@@ -46,7 +51,7 @@ class CoachingSessionService:
         Raises:
             NotFoundError — module has no current version
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             version = await uow.module_versions.get_current_version(module_id)
             if version is None:
                 raise NotFoundError(
@@ -77,13 +82,14 @@ class CoachingSessionService:
         Fetch a coaching session by id.
 
         When user_id is provided, validates ownership.
-        When tenant_id is provided, validates tenant scope.
+        tenant_id scopes the UnitOfWork (RLS) AND is passed to the
+        repository as defence-in-depth.
 
         Raises:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             session = await uow.coaching_sessions.get_by_id(
                 session_id, tenant_id=tenant_id
             )
@@ -97,17 +103,34 @@ class CoachingSessionService:
 
             return session
 
-    async def get_session_detail(self, session_id: UUID) -> CoachingSession:
+    async def get_session_detail(
+        self,
+        session_id: UUID,
+        user_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+    ) -> CoachingSession:
         """
         Fetch a session with messages + feedback eagerly loaded.
 
+        When user_id is provided, validates that the session belongs to them.
+        tenant_id scopes the UnitOfWork (RLS) AND filters the repository read.
+
         Raises:
             NotFoundError — session not found
+            PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.coaching_sessions.get_with_messages(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.coaching_sessions.get_with_messages(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("CoachingSession", session_id)
+
+            if user_id is not None and session.user_id != user_id:
+                raise PermissionDeniedError(
+                    "You do not have permission to access this session."
+                )
+
             return session
 
     # ── Listing ───────────────────────────────────────────────────────────────
@@ -125,7 +148,7 @@ class CoachingSessionService:
 
         Optionally filtered by tenant_id and/or status.
         """
-        async with UnitOfWork() as uow:
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
             return await uow.coaching_sessions.list_by_user(
                 user_id,
                 tenant_id=tenant_id,
@@ -137,7 +160,11 @@ class CoachingSessionService:
     # ── Intake submission ─────────────────────────────────────────────────────
 
     async def submit_intake(
-        self, session_id: UUID, intake_data: dict, user_id: UUID
+        self,
+        session_id: UUID,
+        intake_data: dict,
+        user_id: UUID,
+        tenant_id: UUID | None = None,
     ) -> CoachingSession:
         """
         Submit intake form data for a coaching session.
@@ -153,8 +180,10 @@ class CoachingSessionService:
         if not intake_data:
             raise ValidationError("Intake data must not be empty.")
 
-        async with UnitOfWork() as uow:
-            session = await uow.coaching_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.coaching_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("CoachingSession", session_id)
 
@@ -163,7 +192,6 @@ class CoachingSessionService:
                     "You do not have permission to modify this session."
                 )
 
-            # Update intake_data via repository update
             from app.repositories.session.coaching_session_repository import (
                 CoachingSessionUpdate,
             )
@@ -183,6 +211,7 @@ class CoachingSessionService:
         role: str,
         content: str,
         token_count: int | None = None,
+        tenant_id: UUID | None = None,
     ) -> ConversationMessage:
         """
         Append a message to a coaching session conversation.
@@ -192,12 +221,13 @@ class CoachingSessionService:
         Raises:
             NotFoundError — session not found
         """
-        async with UnitOfWork() as uow:
-            session = await uow.coaching_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.coaching_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("CoachingSession", session_id)
 
-            # Compute next message_index
             current_count = await uow.coaching_sessions.get_message_count(
                 session_id
             )
@@ -218,7 +248,11 @@ class CoachingSessionService:
     # ── Status transitions ────────────────────────────────────────────────────
 
     async def complete_session(
-        self, session_id: UUID, final_score: Decimal, user_id: UUID
+        self,
+        session_id: UUID,
+        final_score: Decimal,
+        user_id: UUID,
+        tenant_id: UUID | None = None,
     ) -> CoachingSession:
         """
         Transition a session from in_progress to completed.
@@ -230,8 +264,10 @@ class CoachingSessionService:
             PermissionDeniedError — session does not belong to user_id
             ConflictError       — session is already completed (raised by repo)
         """
-        async with UnitOfWork() as uow:
-            session = await uow.coaching_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.coaching_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("CoachingSession", session_id)
 
@@ -240,7 +276,6 @@ class CoachingSessionService:
                     "You do not have permission to complete this session."
                 )
 
-            # Compute duration
             now = datetime.now(timezone.utc)
             duration_seconds = int((now - session.created_at).total_seconds())
 
@@ -254,7 +289,10 @@ class CoachingSessionService:
             return session
 
     async def abandon_session(
-        self, session_id: UUID, user_id: UUID
+        self,
+        session_id: UUID,
+        user_id: UUID,
+        tenant_id: UUID | None = None,
     ) -> CoachingSession:
         """
         Transition a session from in_progress to abandoned.
@@ -263,8 +301,10 @@ class CoachingSessionService:
             NotFoundError       — session not found
             PermissionDeniedError — session does not belong to user_id
         """
-        async with UnitOfWork() as uow:
-            session = await uow.coaching_sessions.get_by_id(session_id)
+        async with UnitOfWork(tenant_id=tenant_id) as uow:
+            session = await uow.coaching_sessions.get_by_id(
+                session_id, tenant_id=tenant_id
+            )
             if session is None:
                 raise NotFoundError("CoachingSession", session_id)
 
