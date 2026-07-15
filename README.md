@@ -1,3 +1,74 @@
+# AI Coach Platform
+
+A full-stack AI-powered coaching platform built with **FastAPI**, **React**, and **PostgreSQL**. It supports structured coaching frameworks (SBI, GROW), roleplay simulations, AI-generated feedback reports, a knowledge base with RAG retrieval, and real-time analytics — with multi-tenant support enforced at the database level via Row Level Security.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS, Radix UI, Zustand, React Query |
+| Backend | FastAPI, Python 3.12+, SQLAlchemy 2.0 (async), Alembic |
+| Database | PostgreSQL 16/17, pgvector (optional — falls back to `FLOAT[]` if unavailable) |
+| AI Engine | Ollama (local LLM — gemma3, qwen3, etc.) |
+| Embeddings | sentence-transformers (BAAI/bge-small-en-v1.5), offloaded to a worker thread |
+| Auth | JWT (access + refresh tokens), bcrypt |
+| Tenant isolation | PostgreSQL Row Level Security (RLS), enforced at the DB level, not just app-layer filtering |
+
+---
+
+## Security
+
+This section exists because "we have RLS" and "RLS is actually enforced" are two different claims — this documents what's genuinely true in the code today, not what was originally intended.
+
+- **Row Level Security is enabled and forced** on every tenant-scoped table (migration `011_enforce_rls.py`). Tables without their own `tenant_id` column (e.g. `knowledge_sources`, `module_versions`, `conversation_messages`) are protected via subquery-based policies that resolve tenancy through their parent record.
+- **`UnitOfWork` is fail-closed by default.** Constructing one without an explicit `tenant_id` does *not* grant elevated access — it sees zero rows on tenant-scoped tables. Cross-tenant/system access requires the explicit, greppable `UnitOfWork.system()`.
+- **Ownership is checked at the service layer too**, as defence-in-depth on top of RLS — every session, module, and knowledge-base read/write verifies the caller owns the resource or belongs to its tenant.
+- **A regression test enforces this**: `tests/integration/test_cross_tenant_isolation.py` spins up two real tenants and asserts one can never read, list, update, or delete the other's coaching sessions, modules, or knowledge bases via the real HTTP request path.
+- **Content safety is engine-enforced**, not left to prompt wording. `SafetyEngine` checks both learner input and AI-generated output, on both the coaching and roleplay flows, before anything is stored or shown. Blocked content — including a distinct crisis/self-harm detection path — is written to a persistent audit trail (`audit_logs` table).
+- **Crisis/self-harm language gets a supportive response, not a rejection.** If a learner's message trips the crisis-detection path, the API returns `200` with a supportive message and crisis-line resources instead of a generic error.
+- **Production config is validated at startup.** When `ENVIRONMENT=production`, the app refuses to start if `SECRET_KEY` is under 64 characters or matches a known placeholder, `DEBUG=True`, or `ALLOWED_ORIGINS` is empty, wildcarded, or still pointing at localhost.
+
+Known limitations, documented rather than hidden:
+- `SafetyEngine` is currently keyword/regex-based (an MVP), not LLM-based classification — it can be bypassed by determined obfuscation. Crisis-language resources are a static, US-leaning list (no user locale field exists yet to localize them).
+- RLS enforcement covers session, module, and knowledge-base domains. RBAC join tables (`role_permissions`, `user_roles`, `user_tenants`) and `refresh_tokens` are deliberately *not* RLS-enforced yet, since they're read during login before a tenant context exists — extending RLS there needs a full trace of the auth code paths first.
+- There is currently no public API endpoint to publish a module version — the no-code module builder isn't wired up server-side yet (see Roadmap).
+
+---
+
+## Project Structure
+ai-coach/
+├── backend/                  # FastAPI application
+│   ├── app/
+│   │   ├── ai/               # Coaching, roleplay, scoring, safety engines
+│   │   ├── api/v1/routers/   # Auth, modules, sessions, knowledge, analytics
+│   │   ├── core/             # Config, exceptions, security
+│   │   ├── database/         # Engine, UoW (tenant-scoped by default), base models
+│   │   ├── middleware/       # Logging, request ID
+│   │   ├── models/           # SQLAlchemy ORM models
+│   │   ├── rag/               # Chunking, embedding (thread-offloaded), retrieval, citations
+│   │   ├── repositories/     # Data access layer
+│   │   ├── schemas/          # Pydantic schemas
+│   │   ├── services/         # Business logic, tenant-scoped throughout
+│   │   └── tasks/            # Background tasks (embeddings, analytics)
+│   ├── alembic/               # Database migrations (001–011)
+│   ├── tests/
+│   │   └── integration/      # Cross-tenant isolation regression test
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/                  # React application
+│   ├── src/
+│   │   ├── pages/             # Landing, Login, Register, Dashboard, etc.
+│   │   ├── components/       # Layout, shared UI
+│   │   ├── lib/               # Axios API client, utils
+│   │   ├── stores/             # Zustand auth + theme stores
+│   │   └── types/              # TypeScript types
+│   ├── package.json
+│   └── vite.config.ts
+├── docker-compose.yml
+├── Dockerfile.backend
+└── Dockerfile.frontend
 ---
 
 ## Prerequisites
