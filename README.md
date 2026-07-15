@@ -1,67 +1,14 @@
-# AI Coach Platform
-
-A full-stack AI-powered coaching platform built with **FastAPI**, **React**, and **PostgreSQL**. It supports structured coaching frameworks (SBI, GROW), roleplay simulations, AI-generated feedback reports, a knowledge base with RAG retrieval, and real-time analytics — all with multi-tenant support and role-based access control.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Frontend | React 18, TypeScript, Vite, Tailwind CSS, Radix UI, Zustand, React Query |
-| Backend | FastAPI, Python 3.11+, SQLAlchemy 2.0 (async), Alembic |
-| Database | PostgreSQL 17, pgvector (optional) |
-| AI Engine | Ollama (local LLM — gemma3, qwen3, etc.) |
-| Embeddings | sentence-transformers (BAAI/bge-small-en-v1.5) |
-| Auth | JWT (access + refresh tokens), bcrypt |
-
----
-
-## Project Structure
-
-```
-ai-coach/
-├── backend/                  # FastAPI application
-│   ├── app/
-│   │   ├── ai/               # Coaching, roleplay, scoring engines
-│   │   ├── api/v1/routers/   # Auth, modules, sessions, knowledge, analytics
-│   │   ├── core/             # Config, exceptions, security
-│   │   ├── database/         # Engine, UoW, base models
-│   │   ├── middleware/        # Logging, request ID
-│   │   ├── models/           # SQLAlchemy ORM models
-│   │   ├── rag/              # Chunking, embedding, retrieval, citations
-│   │   ├── repositories/     # Data access layer
-│   │   ├── schemas/          # Pydantic schemas
-│   │   ├── services/         # Business logic
-│   │   └── tasks/            # Background tasks (embeddings, analytics)
-│   ├── alembic/              # Database migrations (001–010)
-│   ├── requirements.txt
-│   └── .env.example
-├── frontend/                 # React application
-│   ├── src/
-│   │   ├── pages/            # Landing, Login, Register, Dashboard, etc.
-│   │   ├── components/       # Layout, shared UI
-│   │   ├── lib/              # Axios API client, utils
-│   │   ├── stores/           # Zustand auth + theme stores
-│   │   └── types/            # TypeScript types
-│   ├── package.json
-│   └── vite.config.ts
-├── docker-compose.yml
-├── Dockerfile.backend
-└── Dockerfile.frontend
-```
-
 ---
 
 ## Prerequisites
 
-Make sure the following are installed before running locally:
-
-- **Python 3.11+** — [python.org](https://www.python.org/downloads/)
+- **Python 3.12+** — [python.org](https://www.python.org/downloads/) (see note below on very new Python versions)
 - **Node.js 18+** — [nodejs.org](https://nodejs.org/)
-- **PostgreSQL 17** — [postgresql.org](https://www.postgresql.org/download/)
+- **PostgreSQL 16 or 17** — [postgresql.org](https://www.postgresql.org/download/) (or via Docker — see below)
 - **Ollama** — [ollama.com](https://ollama.com/) (for local AI inference)
 - **Git**
+
+> **Note on Python version:** some pinned dependencies (`psycopg2-binary`, `pgvector`, `sentence-transformers`) may not have prebuilt wheels for the very latest Python release yet, which can cause `pip install` to try building from source and fail. If you hit build errors, either pin the offending package to a newer version that does have a wheel for your Python, or use Python 3.11/3.12 instead of a bleeding-edge release.
 
 ---
 
@@ -70,7 +17,7 @@ Make sure the following are installed before running locally:
 ### Step 1 — Clone the repo
 
 ```bash
-git clone https://github.com/gantaNandini/ai-coach.git
+git clone https://github.com/P-lahari93/ai-coach.git
 cd ai-coach
 ```
 
@@ -78,13 +25,22 @@ cd ai-coach
 
 ### Step 2 — Set up PostgreSQL
 
-Open a terminal and create the database and user:
+**Via Docker (recommended — simplest path):**
 
 ```bash
-# On Windows (run as Administrator or use psql as postgres user)
+docker run --name ai-coach-db \
+  -e POSTGRES_USER=aicoach \
+  -e POSTGRES_PASSWORD=aicoach \
+  -e POSTGRES_DB=aicoach \
+  -p 5432:5432 \
+  -d pgvector/pgvector:pg16
+```
+
+**Or a native install** — create the database and user manually:
+
+```bash
 psql -U postgres -h localhost
 
-# Inside psql prompt, run:
 CREATE USER aicoach WITH PASSWORD 'aicoach';
 CREATE DATABASE aicoach OWNER aicoach;
 GRANT ALL PRIVILEGES ON DATABASE aicoach TO aicoach;
@@ -98,32 +54,26 @@ GRANT ALL PRIVILEGES ON DATABASE aicoach TO aicoach;
 ```bash
 cd backend
 
-# Create virtual environment
 python -m venv .venv
 
-# Activate it
 # Windows:
 .venv\Scripts\activate
 # macOS / Linux:
 source .venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 #### Create your `.env` file
 
-Copy the example and fill in your values:
-
 ```bash
 # Windows
 copy .env.example .env
-
 # macOS / Linux
 cp .env.example .env
 ```
 
-Edit `.env` with the correct settings:
+Edit `.env`:
 
 ```dotenv
 APP_NAME=AI Coach
@@ -132,57 +82,55 @@ ENVIRONMENT=development
 DEBUG=true
 API_V1_PREFIX=/api/v1
 
-# Generate a strong secret: python -c "import secrets; print(secrets.token_hex(32))"
+# Generate a strong secret: python -c "import secrets; print(secrets.token_urlsafe(64))"
+# Minimum 32 chars in development, but the app HARD-FAILS at startup if
+# ENVIRONMENT=production and this is under 64 chars or a known placeholder.
 SECRET_KEY=your-secret-key-at-least-32-characters-long
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 REFRESH_TOKEN_EXPIRE_DAYS=7
 
-# PostgreSQL — use the credentials you created in Step 2
 DATABASE_URL=postgresql+asyncpg://aicoach:aicoach@localhost:5432/aicoach
 DATABASE_POOL_SIZE=10
 DATABASE_MAX_OVERFLOW=20
 
-# Ollama — local AI server
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=gemma3:latest
 OLLAMA_TIMEOUT=600
 OLLAMA_MAX_TOKENS=2048
 OLLAMA_TEMPERATURE=0.7
 
-# Embeddings
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 EMBEDDING_DIMENSION=384
 EMBEDDING_BATCH_SIZE=32
 
-# RAG settings
 RAG_CHUNK_SIZE=512
 RAG_CHUNK_OVERLAP=64
 RAG_TOP_K=6
 RAG_SCORE_THRESHOLD=0.35
 RAG_TOKEN_BUDGET=2048
 
-# File uploads
 UPLOAD_DIR=uploads
 MAX_UPLOAD_SIZE_MB=50
 ALLOWED_UPLOAD_EXTENSIONS=[".pdf",".docx",".pptx",".txt",".md"]
 
-# CORS — frontend dev server URL
+# CORS — must NOT contain localhost or "*" if ENVIRONMENT=production
 ALLOWED_ORIGINS=["http://localhost:5173","http://localhost:3000"]
 ```
 
 #### Run database migrations
 
 ```bash
-# From the backend/ directory (with .venv active)
 alembic upgrade head
 ```
 
-This runs all 10 migrations and seeds the database with:
+This runs all 11 migrations, including enabling Row Level Security, and seeds:
 - SBI and GROW coaching frameworks
 - Framework steps and prompt templates
-- Roles (admin, manager, learner)
+- Roles (superadmin, tenant_admin, program_owner, learner)
 - Default tenant
+
+If `pgvector` isn't installed in your Postgres, migration `009` logs a warning and falls back to `FLOAT[]` for embeddings — everything else still works, but HNSW-accelerated vector search is disabled until `CREATE EXTENSION vector;` is run.
 
 #### Start the backend server
 
@@ -190,79 +138,54 @@ This runs all 10 migrations and seeds the database with:
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Backend runs at: **http://localhost:8000**
-API docs (Swagger): **http://localhost:8000/docs**
-Health check: **http://localhost:8000/health**
+- Backend: **http://localhost:8000**
+- API docs (Swagger): **http://localhost:8000/docs**
+- Health check: **http://localhost:8000/health**
 
 ---
 
 ### Step 4 — Set up Ollama (AI Engine)
 
-Ollama must be running for AI feedback generation to work.
-
 ```bash
-# Install Ollama from https://ollama.com/
-# Then pull the model used by this app:
 ollama pull gemma3:latest
-
-# Verify Ollama is running:
 ollama serve
 ```
 
-Ollama runs at: **http://localhost:11434**
+Ollama runs at **http://localhost:11434**.
 
-> If Ollama is not running, the app will still work — coaching and roleplay sessions will fall back to a minimal "AI unavailable" feedback report.
+> If Ollama is not running, coaching and roleplay completion will fail on the AI-generation step but the session still completes with a fallback "AI feedback unavailable" report rather than crashing.
 
 ---
 
 ### Step 5 — Set up the Frontend
 
-Open a **new terminal**:
-
 ```bash
 cd frontend
-
-# Install dependencies
 npm install
-
-# Start the development server
 npm run dev
 ```
 
-Frontend runs at: **http://localhost:5173**
+Frontend: **http://localhost:5173**
 
 ---
 
 ### Step 6 — Open the App
 
 1. Go to **http://localhost:5173**
-2. Click **Get Started** → **Register** a new account
-3. Login with your credentials
-4. You'll land on the **Dashboard**
+2. Register → Login → land on the **Dashboard**
 
 ---
 
 ## Option B — Run with Docker Compose
 
-If you have Docker Desktop installed, you can run the entire stack with one command.
-
 ```bash
-git clone https://github.com/gantaNandini/ai-coach.git
+git clone https://github.com/P-lahari93/ai-coach.git
 cd ai-coach
-
-# Start all services (PostgreSQL, Ollama, Backend, Frontend)
 docker-compose up --build
 ```
 
-Then run migrations inside the backend container:
-
 ```bash
 docker-compose exec backend alembic upgrade head
-```
-
-Pull the AI model into the Ollama container:
-
-```bash
 docker-compose exec ollama ollama pull gemma3:latest
 ```
 
@@ -275,41 +198,47 @@ docker-compose exec ollama ollama pull gemma3:latest
 
 ---
 
+## Running Tests
+
+```bash
+cd backend
+pytest tests/integration/test_cross_tenant_isolation.py -v
+```
+
+This is the one test suite currently in the repo — it's a real regression guard, not a smoke test: it creates two separate tenants with real data and asserts, via actual HTTP calls, that one tenant can never read, list, update, or delete another tenant's coaching sessions, modules, or knowledge bases. It requires a running, migrated Postgres (see Step 2–3 above) and reuses whatever `DATABASE_URL`/`SECRET_KEY` are set in your environment — there's no isolated test database yet, so it writes real rows to whatever DB you point it at.
+
+Broader unit/integration test coverage beyond this one suite doesn't exist yet — see Roadmap.
+
+---
+
 ## Application Walkthrough
 
 ### Register & Login
 - Visit `/register` to create an account
-- Login at `/login` — you receive a JWT access token (stored in memory) and a refresh token (httpOnly cookie)
+- Login at `/login` for JWT access + refresh tokens
 
 ### Dashboard
-- Shows your active sessions, completion rate, average score, and recent feedback
+- Active sessions, completion rate, average score, recent feedback
 
 ### Modules
 - Lists available coaching modules (SBI, GROW, and any custom ones)
-- Each module card shows the framework, difficulty, and estimated duration
 
 ### Coaching Session (SBI / GROW)
 - Select a module → start a session
-- Fill in the **dynamic intake form** (fields are driven by the module's `intake_schema` — no hardcoding)
-- Submit → AI generates a structured feedback report
-- View your **Feedback Report** with score, strengths, improvements, and recommendations
+- Fill in the dynamic intake form (driven by the module's `intake_schema`)
+- Submit → real, model-generated per-dimension rubric scoring (not keyword heuristics) → structured feedback report with strengths, improvements, recommendations
+- Both the intake you submit and the AI's own output are checked by `SafetyEngine` before anything is stored
 
 ### Roleplay Session
-- Select a module with a roleplay persona
-- Chat back and forth with the AI persona
-- Complete the session → AI generates a roleplay-specific feedback report
+- Select a module with a roleplay persona, converse turn-by-turn
+- Complete the session → same real AI-scoring and safety-check pipeline as coaching sessions
 
 ### Knowledge Base
 - Upload documents (PDF, DOCX, PPTX, TXT, MD) or paste text
-- Documents are chunked and embedded
-- Retrieved chunks are injected into coaching prompts to ground AI responses
+- Chunked, embedded (off the event loop, in a worker thread), retrieved via RAG and cited in coaching prompts
 
 ### Analytics
-- View session statistics, completion rates, and score trends
-- Module-level performance breakdown
-
-### Profile
-- Update your display name and preferences
+- Session statistics, completion rates, score trends, module-level breakdown
 
 ---
 
@@ -324,20 +253,30 @@ All routes are prefixed with `/api/v1`. Full interactive docs at `/docs`.
 | POST | `/auth/refresh` | Refresh access token |
 | POST | `/auth/logout` | Logout (revoke refresh token) |
 | GET | `/auth/me` | Get current user profile |
-| GET | `/modules` | List coaching modules |
+| GET | `/modules` | List coaching modules (tenant-scoped + global) |
 | GET | `/modules/{id}` | Get module detail + intake schema |
+| PATCH | `/modules/{id}` | Update module (owning tenant only) |
+| POST | `/modules/{id}/publish` | Publish module (owning tenant only) |
+| POST | `/modules/{id}/archive` | Archive module (owning tenant only) |
+| DELETE | `/modules/{id}` | Soft-delete module (owning tenant only) |
 | POST | `/sessions/coaching` | Start a coaching session |
-| GET | `/sessions/coaching/{id}` | Get session + intake_schema |
-| POST | `/sessions/coaching/{id}/complete` | Submit intake data + generate AI feedback |
+| GET | `/sessions/coaching/{id}` | Get session + intake_schema (owner or tenant admin only) |
+| POST | `/sessions/coaching/{id}/complete` | Submit intake + generate real AI feedback |
+| POST | `/sessions/coaching/{id}/abandon` | Abandon a session (owner only) |
 | POST | `/sessions/roleplay` | Start a roleplay session |
-| POST | `/sessions/roleplay/{id}/turn` | Submit a roleplay message |
+| GET | `/sessions/roleplay/{id}` | Get roleplay session (owner only) |
+| POST | `/sessions/roleplay/{id}/turn` | Submit a roleplay message (safety-checked both ways) |
 | POST | `/sessions/roleplay/{id}/complete` | Complete roleplay + generate feedback |
-| GET | `/feedback/{id}` | Get feedback report |
-| GET | `/knowledge` | List knowledge bases |
+| GET | `/feedback/{id}` | Get feedback report (owner only) |
+| POST | `/feedback/{id}/rate` | Submit a 1–5 rating |
+| GET | `/knowledge` | List knowledge bases (tenant-scoped) |
 | POST | `/knowledge` | Create knowledge base |
-| POST | `/knowledge/{id}/ingest` | Upload and ingest a document |
+| DELETE | `/knowledge/{id}` | Delete knowledge base (owning tenant only) |
+| GET | `/knowledge/{id}/sources` | List sources in a KB (owning tenant only) |
+| POST | `/knowledge/{id}/sources/text` | Ingest pasted text |
+| POST | `/knowledge/{id}/sources/upload` | Upload and ingest a document |
+| DELETE | `/knowledge/{id}/sources/{source_id}` | Delete a source (owning tenant only) |
 | GET | `/analytics/dashboard` | Dashboard metrics |
-| GET | `/analytics/sessions` | Session analytics |
 | GET | `/progress/me` | User progress and achievements |
 
 ---
@@ -345,18 +284,9 @@ All routes are prefixed with `/api/v1`. Full interactive docs at `/docs`.
 ## Database Migrations
 
 ```bash
-# From backend/ with .venv active
-
-# Apply all migrations
 alembic upgrade head
-
-# Check current version
 alembic current
-
-# Rollback one step
 alembic downgrade -1
-
-# Rollback everything
 alembic downgrade base
 ```
 
@@ -364,16 +294,17 @@ alembic downgrade base
 
 | Version | Description |
 |---|---|
-| 001 | Create PostgreSQL extensions (uuid-ossp, btree_gist) |
+| 001 | Create PostgreSQL extensions (uuid-ossp, pgvector) |
 | 002 | Base tables (tenants, users) |
 | 003 | RBAC tables (roles, permissions, user_roles) |
 | 004 | Module tables (coaching_modules, module_versions, framework_steps, personas, prompt_templates, rubrics) |
 | 005 | Knowledge tables (knowledge_bases, knowledge_sources, knowledge_chunks) |
-| 006 | Session tables (coaching_sessions, session_messages, roleplay_sessions, roleplay_messages, feedback_reports) |
+| 006 | Session tables (coaching_sessions, conversation_messages, roleplay_sessions, roleplay_messages, feedback_reports) |
 | 007 | Progress and gamification tables (user_progress, achievements, notifications) |
-| 008 | Analytics tables (partitioned by month) |
-| 009 | HNSW vector index (pgvector — skipped if extension unavailable) |
-| 010 | Enable RLS policies + seed data (roles, default tenant, SBI/GROW modules) |
+| 008 | Analytics tables, including the `audit_logs` table used by the safety engine (partitioned by month) |
+| 009 | HNSW vector index (pgvector — skipped, with a `FLOAT[]` fallback, if the extension is unavailable) |
+| 010 | Seed data (roles, default tenant, SBI/GROW modules) |
+| 011 | **Actually enables Row Level Security.** Migration 010 originally defined but never invoked RLS policy creation — this migration fixes that, correctly handling tables whose tenancy is inherited via a parent record rather than their own `tenant_id` column. |
 
 ---
 
@@ -381,87 +312,67 @@ alembic downgrade base
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | *(required)* | JWT signing secret — min 32 characters |
+| `ENVIRONMENT` | `development` | `development` \| `staging` \| `production`. Only `production` triggers the startup hardening checks below. |
+| `SECRET_KEY` | *(required)* | JWT signing secret — min 32 chars always; **min 64 chars required, and default/placeholder values rejected, when `ENVIRONMENT=production`** |
+| `DEBUG` | `false` | Must be `false` when `ENVIRONMENT=production` — startup fails otherwise |
 | `DATABASE_URL` | *(required)* | PostgreSQL async DSN |
+| `ALLOWED_ORIGINS` | `["http://localhost:5173"]` | CORS allowed origins. Must not be empty, wildcarded, or contain localhost when `ENVIRONMENT=production` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `gemma3:latest` | LLM model name |
 | `OLLAMA_TIMEOUT` | `600` | Request timeout in seconds |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Sentence transformer model |
 | `EMBEDDING_DIMENSION` | `384` | Vector dimension |
 | `RAG_TOP_K` | `6` | Number of chunks to retrieve |
-| `ALLOWED_ORIGINS` | `["http://localhost:5173"]` | CORS allowed origins |
 | `UPLOAD_DIR` | `uploads` | Directory for uploaded files |
 | `MAX_UPLOAD_SIZE_MB` | `50` | Maximum file size |
-| `DEBUG` | `false` | Enable debug mode |
 
 ---
 
 ## Troubleshooting
 
 **Backend won't start — `SECRET_KEY` error**
-```
-SECRET_KEY must be at least 32 characters.
-```
-Generate one: `python -c "import secrets; print(secrets.token_hex(32))"`
+Generate one: `python -c "import secrets; print(secrets.token_urlsafe(64))"`
 
----
+**Backend refuses to start with `ENVIRONMENT=production`**
+This is intentional — the app hard-fails on a weak `SECRET_KEY`, `DEBUG=True`, or a localhost/wildcard CORS origin rather than booting insecurely. The error message lists every specific problem found; fix each one and restart.
 
 **`alembic upgrade head` fails — connection refused**
-
-Make sure PostgreSQL is running and the credentials in `DATABASE_URL` match what you created in Step 2.
-
 ```bash
-# Test the connection
-psql -U aicoach -h localhost -d aicoach
-# Password: aicoach
+psql -U aicoach -h localhost -d aicoach   # password: aicoach
 ```
 
----
+**`alembic upgrade head` fails on migration 011 — `column "tenant_id" does not exist`**
+This means the migration's assumptions about which tables carry their own `tenant_id` column vs. inherit tenancy from a parent don't match your actual schema (e.g. if you've made local schema changes). Check the affected table's real columns before adjusting the migration.
 
-**AI feedback returns score 0 / fallback message**
-
-Ollama is not running or the model isn't pulled:
+**AI feedback returns a fallback / "unavailable" message**
 ```bash
-ollama serve          # start Ollama
-ollama pull gemma3:latest   # pull the model
+ollama serve
+ollama pull gemma3:latest
 ```
 
----
+**A request that should succeed returns an empty list or a 403/404**
+Since RLS is fail-closed, this usually means the request's tenant context (JWT `tenant_id` claim) doesn't match the resource's actual tenant — this is enforcement working as intended, not a bug, but worth double-checking which tenant the calling user actually belongs to.
 
 **Frontend shows blank page or API errors**
-
-Check that the backend is running on port 8000 and CORS is configured:
-```dotenv
-ALLOWED_ORIGINS=["http://localhost:5173"]
-```
-
----
+Confirm the backend is on port 8000 and `ALLOWED_ORIGINS` includes your frontend's origin.
 
 **`npm install` fails**
-
-Make sure you're in the `frontend/` directory and Node.js 18+ is installed:
 ```bash
 node --version   # should be 18+
-npm --version
 ```
 
 ---
 
-## Features Summary
+## Roadmap / Known Gaps
 
-- ✅ JWT authentication with refresh token rotation
-- ✅ Role-based access control (admin, manager, learner)
-- ✅ Multi-tenant architecture
-- ✅ Dynamic coaching frameworks (SBI, GROW — data-driven, no hardcoding)
-- ✅ Dynamic intake forms (rendered from `intake_schema` in module version)
-- ✅ AI-generated feedback with rubric-driven scoring
-- ✅ Roleplay simulation with AI persona responses
-- ✅ Knowledge base with document ingestion and RAG retrieval
-- ✅ Citation tracking in feedback reports
-- ✅ Progress tracking and achievements
-- ✅ Analytics dashboard with real database aggregation
-- ✅ 56 REST API endpoints
-- ✅ Docker Compose support
+Documented honestly rather than left implicit:
+
+- **Identity & access**: no password reset, email verification, user invitations, MFA, or SSO yet — self-registration with local password auth only.
+- **Module lifecycle**: no author-time preview/dry-run before publish, no draft→review→publish approval gate, no version rollback UI, and no public API endpoint to create/publish a module version at all yet (the version-authoring workflow isn't wired up server-side).
+- **Billing & cost tracking**: no per-tenant token/cost metering, no AI-endpoint-specific rate limiting.
+- **Compliance**: no GDPR data export or compliant hard-delete; audit events are now written (see Security section) but there's no admin-facing UI to read/filter/export them yet.
+- **Test coverage**: one integration test suite exists (cross-tenant isolation). No unit tests, no CI pipeline running tests automatically yet.
+- **RLS coverage**: extends to session/module/knowledge-base domains; RBAC/auth-plumbing tables are deliberately not yet covered (see Security section for why).
 
 ---
 
